@@ -7,6 +7,11 @@
 (define-constant ERR_INSUFFICIENT_STAKE (err u105))
 (define-constant ERR_FORK_NOT_FOUND (err u106))
 (define-constant ERR_INVALID_THRESHOLD (err u107))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u108))
+(define-constant ERR_SELF_DELEGATION (err u109))
+(define-constant ERR_CIRCULAR_DELEGATION (err u110))
+(define-constant ERR_DELEGATE_NOT_MEMBER (err u111))
+(define-constant ERR_DELEGATION_EXISTS (err u112))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var fork-counter uint u0)
@@ -57,6 +62,21 @@
 (define-map user-stakes
   principal
   uint
+)
+
+(define-map delegations
+  { fork-id: uint, delegator: principal }
+  { delegate: principal, delegated-at: uint, active: bool }
+)
+
+(define-map delegate-powers
+  { fork-id: uint, delegate: principal }
+  { total-delegated-power: uint, delegator-count: uint }
+)
+
+(define-map delegation-chains
+  { fork-id: uint, original-delegator: principal }
+  { final-delegate: principal, chain-length: uint }
 )
 
 (define-public (create-genesis-fork (name (string-ascii 50)) (description (string-ascii 300)) (voting-threshold uint))
@@ -158,13 +178,91 @@
   )
 )
 
+(define-private (get-effective-voting-power (fork-id uint) (voter principal))
+  (let
+    (
+      (member-data (map-get? fork-members { fork-id: fork-id, member: voter }))
+      (delegate-power (default-to { total-delegated-power: u0, delegator-count: u0 } 
+                      (map-get? delegate-powers { fork-id: fork-id, delegate: voter })))
+    )
+    (match member-data
+      member
+      (+ (get voting-power member) (get total-delegated-power delegate-power))
+      u0
+    )
+  )
+)
+
+(define-private (get-direct-delegate (fork-id uint) (delegator principal))
+  (match (map-get? delegations { fork-id: fork-id, delegator: delegator })
+    delegation
+    (if (get active delegation)
+      (get delegate delegation)
+      delegator
+    )
+    delegator
+  )
+)
+
+(define-public (delegate-voting-power (fork-id uint) (delegate principal))
+  (let
+    (
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (delegator-member (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
+      (delegate-member (unwrap! (map-get? fork-members { fork-id: fork-id, member: delegate }) ERR_DELEGATE_NOT_MEMBER))
+      (existing-delegation (map-get? delegations { fork-id: fork-id, delegator: tx-sender }))
+      (delegator-power (get voting-power delegator-member))
+      (current-delegate-power (default-to { total-delegated-power: u0, delegator-count: u0 } 
+                              (map-get? delegate-powers { fork-id: fork-id, delegate: delegate })))
+    )
+    (asserts! (get active fork-data) ERR_FORK_NOT_FOUND)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    (asserts! (is-none existing-delegation) ERR_DELEGATION_EXISTS)
+
+    (map-set delegations { fork-id: fork-id, delegator: tx-sender } {
+      delegate: delegate,
+      delegated-at: stacks-block-height,
+      active: true
+    })
+    (map-set delegate-powers { fork-id: fork-id, delegate: delegate } {
+      total-delegated-power: (+ (get total-delegated-power current-delegate-power) delegator-power),
+      delegator-count: (+ (get delegator-count current-delegate-power) u1)
+    })
+    (map-set delegation-chains { fork-id: fork-id, original-delegator: tx-sender } {
+      final-delegate: delegate,
+      chain-length: u1
+    })
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation (fork-id uint))
+  (let
+    (
+      (delegation (unwrap! (map-get? delegations { fork-id: fork-id, delegator: tx-sender }) ERR_DELEGATION_NOT_FOUND))
+      (delegate (get delegate delegation))
+      (delegator-member (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
+      (delegator-power (get voting-power delegator-member))
+      (current-delegate-power (unwrap! (map-get? delegate-powers { fork-id: fork-id, delegate: delegate }) ERR_DELEGATION_NOT_FOUND))
+    )
+    (asserts! (get active delegation) ERR_DELEGATION_NOT_FOUND)
+    (map-set delegations { fork-id: fork-id, delegator: tx-sender } (merge delegation { active: false }))
+    (map-set delegate-powers { fork-id: fork-id, delegate: delegate } {
+      total-delegated-power: (- (get total-delegated-power current-delegate-power) delegator-power),
+      delegator-count: (- (get delegator-count current-delegate-power) u1)
+    })
+    (map-delete delegation-chains { fork-id: fork-id, original-delegator: tx-sender })
+    (ok true)
+  )
+)
+
 (define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
   (let
     (
       (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
       (fork-id (get fork-id proposal))
       (member-data (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
-      (voting-power (get voting-power member-data))
+      (voting-power (get-effective-voting-power fork-id tx-sender))
     )
     (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
     (asserts! (<= stacks-block-height (get end-block proposal)) ERR_VOTING_ENDED)
@@ -250,6 +348,40 @@
       })
     )
     ERR_PROPOSAL_NOT_FOUND
+  )
+)
+
+(define-read-only (get-delegation (fork-id uint) (delegator principal))
+  (map-get? delegations { fork-id: fork-id, delegator: delegator })
+)
+
+(define-read-only (get-delegate-power (fork-id uint) (delegate principal))
+  (map-get? delegate-powers { fork-id: fork-id, delegate: delegate })
+)
+
+(define-read-only (get-delegation-chain (fork-id uint) (original-delegator principal))
+  (map-get? delegation-chains { fork-id: fork-id, original-delegator: original-delegator })
+)
+
+(define-read-only (get-effective-power (fork-id uint) (member principal))
+  (ok (get-effective-voting-power fork-id member))
+)
+
+
+
+(define-read-only (check-delegation-validity (fork-id uint) (delegator principal) (proposed-delegate principal))
+  (let
+    (
+      (delegator-member (map-get? fork-members { fork-id: fork-id, member: delegator }))
+      (delegate-member (map-get? fork-members { fork-id: fork-id, member: proposed-delegate }))
+      (existing-delegation (map-get? delegations { fork-id: fork-id, delegator: delegator }))
+    )
+    (ok {
+      delegator-is-member: (is-some delegator-member),
+      delegate-is-member: (is-some delegate-member),
+      no-existing-delegation: (is-none existing-delegation),
+      not-self-delegation: (not (is-eq delegator proposed-delegate))
+    })
   )
 )
 
