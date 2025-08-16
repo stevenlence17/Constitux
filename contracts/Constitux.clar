@@ -12,6 +12,12 @@
 (define-constant ERR_CIRCULAR_DELEGATION (err u110))
 (define-constant ERR_DELEGATE_NOT_MEMBER (err u111))
 (define-constant ERR_DELEGATION_EXISTS (err u112))
+(define-constant ERR_INSUFFICIENT_TREASURY_FUNDS (err u113))
+(define-constant ERR_TREASURY_NOT_FOUND (err u114))
+(define-constant ERR_INVALID_AMOUNT (err u115))
+(define-constant ERR_WITHDRAWAL_NOT_APPROVED (err u116))
+(define-constant ERR_PROPOSAL_NOT_FUNDED (err u117))
+(define-constant ERR_TREASURY_LOCKED (err u118))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var fork-counter uint u0)
@@ -79,6 +85,47 @@
   { final-delegate: principal, chain-length: uint }
 )
 
+(define-map fork-treasuries
+  uint
+  { 
+    balance: uint,
+    total-contributions: uint,
+    total-withdrawals: uint,
+    locked: bool,
+    created-at: uint
+  }
+)
+
+(define-map treasury-contributions
+  { fork-id: uint, contributor: principal }
+  { total-contributed: uint, last-contribution: uint, contribution-count: uint }
+)
+
+(define-map funded-proposals
+  uint
+  {
+    funding-amount: uint,
+    funded-at: uint,
+    funded-by-fork: uint,
+    funding-approved: bool
+  }
+)
+
+(define-map treasury-withdrawals
+  uint
+  {
+    fork-id: uint,
+    amount: uint,
+    recipient: principal,
+    purpose: (string-ascii 100),
+    requested-at: uint,
+    approved: bool,
+    executed: bool
+  }
+)
+
+(define-data-var withdrawal-counter uint u0)
+
 (define-public (create-genesis-fork (name (string-ascii 50)) (description (string-ascii 300)) (voting-threshold uint))
   (let
     (
@@ -99,6 +146,13 @@
       stake: u0,
       joined-at: stacks-block-height,
       voting-power: u100
+    })
+    (map-set fork-treasuries fork-id {
+      balance: u0,
+      total-contributions: u0,
+      total-withdrawals: u0,
+      locked: false,
+      created-at: stacks-block-height
     })
     (var-set fork-counter fork-id)
     (ok fork-id)
@@ -127,6 +181,13 @@
       stake: u0,
       joined-at: stacks-block-height,
       voting-power: u100
+    })
+    (map-set fork-treasuries fork-id {
+      balance: u0,
+      total-contributions: u0,
+      total-withdrawals: u0,
+      locked: false,
+      created-at: stacks-block-height
     })
     (var-set fork-counter fork-id)
     (ok fork-id)
@@ -369,6 +430,151 @@
 
 
 
+(define-public (contribute-to-treasury (fork-id uint) (amount uint))
+  (let
+    (
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+      (member-data (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
+      (current-contribution (default-to { total-contributed: u0, last-contribution: u0, contribution-count: u0 }
+                            (map-get? treasury-contributions { fork-id: fork-id, contributor: tx-sender })))
+    )
+    (asserts! (get active fork-data) ERR_FORK_NOT_FOUND)
+    (asserts! (not (get locked treasury)) ERR_TREASURY_LOCKED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set fork-treasuries fork-id (merge treasury {
+      balance: (+ (get balance treasury) amount),
+      total-contributions: (+ (get total-contributions treasury) amount)
+    }))
+    (map-set treasury-contributions { fork-id: fork-id, contributor: tx-sender } {
+      total-contributed: (+ (get total-contributed current-contribution) amount),
+      last-contribution: stacks-block-height,
+      contribution-count: (+ (get contribution-count current-contribution) u1)
+    })
+    (ok true)
+  )
+)
+
+(define-public (fund-proposal (proposal-id uint) (amount uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (fork-id (get fork-id proposal))
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+      (member-data (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (get active fork-data) ERR_FORK_NOT_FOUND)
+    (asserts! (not (get locked treasury)) ERR_TREASURY_LOCKED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get balance treasury) amount) ERR_INSUFFICIENT_TREASURY_FUNDS)
+    (asserts! (get executed proposal) ERR_VOTING_ACTIVE)
+    (asserts! (is-none (map-get? funded-proposals proposal-id)) ERR_PROPOSAL_NOT_FUNDED)
+    (map-set fork-treasuries fork-id (merge treasury {
+      balance: (- (get balance treasury) amount),
+      total-withdrawals: (+ (get total-withdrawals treasury) amount)
+    }))
+    (map-set funded-proposals proposal-id {
+      funding-amount: amount,
+      funded-at: stacks-block-height,
+      funded-by-fork: fork-id,
+      funding-approved: true
+    })
+    (try! (as-contract (stx-transfer? amount tx-sender (get proposer proposal))))
+    (ok true)
+  )
+)
+
+(define-public (request-treasury-withdrawal (fork-id uint) (amount uint) (recipient principal) (purpose (string-ascii 100)))
+  (let
+    (
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+      (member-data (unwrap! (map-get? fork-members { fork-id: fork-id, member: tx-sender }) ERR_NOT_AUTHORIZED))
+      (withdrawal-id (+ (var-get withdrawal-counter) u1))
+    )
+    (asserts! (get active fork-data) ERR_FORK_NOT_FOUND)
+    (asserts! (not (get locked treasury)) ERR_TREASURY_LOCKED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get balance treasury) amount) ERR_INSUFFICIENT_TREASURY_FUNDS)
+    (map-set treasury-withdrawals withdrawal-id {
+      fork-id: fork-id,
+      amount: amount,
+      recipient: recipient,
+      purpose: purpose,
+      requested-at: stacks-block-height,
+      approved: false,
+      executed: false
+    })
+    (var-set withdrawal-counter withdrawal-id)
+    (ok withdrawal-id)
+  )
+)
+
+(define-public (approve-treasury-withdrawal (withdrawal-id uint))
+  (let
+    (
+      (withdrawal (unwrap! (map-get? treasury-withdrawals withdrawal-id) ERR_WITHDRAWAL_NOT_APPROVED))
+      (fork-id (get fork-id withdrawal))
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator fork-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get approved withdrawal)) ERR_WITHDRAWAL_NOT_APPROVED)
+    (asserts! (not (get executed withdrawal)) ERR_WITHDRAWAL_NOT_APPROVED)
+    (asserts! (>= (get balance treasury) (get amount withdrawal)) ERR_INSUFFICIENT_TREASURY_FUNDS)
+    (map-set treasury-withdrawals withdrawal-id (merge withdrawal { approved: true }))
+    (ok true)
+  )
+)
+
+(define-public (execute-treasury-withdrawal (withdrawal-id uint))
+  (let
+    (
+      (withdrawal (unwrap! (map-get? treasury-withdrawals withdrawal-id) ERR_WITHDRAWAL_NOT_APPROVED))
+      (fork-id (get fork-id withdrawal))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+      (amount (get amount withdrawal))
+      (recipient (get recipient withdrawal))
+    )
+    (asserts! (get approved withdrawal) ERR_WITHDRAWAL_NOT_APPROVED)
+    (asserts! (not (get executed withdrawal)) ERR_WITHDRAWAL_NOT_APPROVED)
+    (asserts! (>= (get balance treasury) amount) ERR_INSUFFICIENT_TREASURY_FUNDS)
+    (map-set fork-treasuries fork-id (merge treasury {
+      balance: (- (get balance treasury) amount),
+      total-withdrawals: (+ (get total-withdrawals treasury) amount)
+    }))
+    (map-set treasury-withdrawals withdrawal-id (merge withdrawal { executed: true }))
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    (ok true)
+  )
+)
+
+(define-public (lock-treasury (fork-id uint))
+  (let
+    (
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator fork-data)) ERR_NOT_AUTHORIZED)
+    (map-set fork-treasuries fork-id (merge treasury { locked: true }))
+    (ok true)
+  )
+)
+
+(define-public (unlock-treasury (fork-id uint))
+  (let
+    (
+      (fork-data (unwrap! (map-get? forks fork-id) ERR_FORK_NOT_FOUND))
+      (treasury (unwrap! (map-get? fork-treasuries fork-id) ERR_TREASURY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator fork-data)) ERR_NOT_AUTHORIZED)
+    (map-set fork-treasuries fork-id (merge treasury { locked: false }))
+    (ok true)
+  )
+)
+
 (define-read-only (check-delegation-validity (fork-id uint) (delegator principal) (proposed-delegate principal))
   (let
     (
@@ -385,6 +591,36 @@
   )
 )
 
+(define-read-only (get-treasury (fork-id uint))
+  (map-get? fork-treasuries fork-id)
+)
+
+(define-read-only (get-treasury-contribution (fork-id uint) (contributor principal))
+  (map-get? treasury-contributions { fork-id: fork-id, contributor: contributor })
+)
+
+(define-read-only (get-funded-proposal (proposal-id uint))
+  (map-get? funded-proposals proposal-id)
+)
+
+(define-read-only (get-treasury-withdrawal (withdrawal-id uint))
+  (map-get? treasury-withdrawals withdrawal-id)
+)
+
+(define-read-only (get-treasury-stats (fork-id uint))
+  (match (map-get? fork-treasuries fork-id)
+    treasury
+    (ok {
+      balance: (get balance treasury),
+      total-contributions: (get total-contributions treasury),
+      total-withdrawals: (get total-withdrawals treasury),
+      locked: (get locked treasury),
+      net-funds: (- (get total-contributions treasury) (get total-withdrawals treasury))
+    })
+    ERR_TREASURY_NOT_FOUND
+  )
+)
+
 (define-read-only (get-fork-stats (fork-id uint))
   (match (map-get? forks fork-id)
     fork-data
@@ -398,3 +634,4 @@
     ERR_FORK_NOT_FOUND
   )
 )
+
